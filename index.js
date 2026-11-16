@@ -24,6 +24,8 @@ const TIPS = {
     write_unconfirmed: "当前词可能已经写入。稍后用「核对」查询，暂时不要重复推送。",
     invalid_response: "服务返回了无法识别的数据，已停止，未尝试的词可稍后重试。",
     network_error: "请求没有完成，检查网络后再试。",
+    wordbook_changed: "读取时生词本发生变化，已停止。请稍后重新核对。",
+    wordbook_timeout: "读取生词本耗时较长，已停止。请稍后重新核对。",
     more_remaining: "本次运行时间已到。需要继续时，用返回的剩余词表再推一批。",
     cancelled: "已取消推送。",
     busy: "另一个不背单词任务正在运行，请等它结束。",
@@ -96,24 +98,66 @@ function validate({ status, data }, account = true) {
 }
 
 function createClient(request) {
+    async function read(url, account = true) {
+        for (let attempt = 0; ; attempt++) {
+            try {
+                return validate(await request(url, { account }), account);
+            } catch (error) {
+                if (attempt || error.code !== "network_error") throw error;
+                await new Promise(resolve => setTimeout(resolve, 600));
+            }
+        }
+    }
     return {
         async login() {
-            const data = validate(await request(ORIGIN + "/api/check-login"));
+            const data = await read(ORIGIN + "/api/check-login");
             if (businessCode(data) !== 200) throw new BbdcError("invalid_response");
         },
-        async exists(word) {
-            const url = ORIGIN + "/api/check-new-word?" + new URLSearchParams({ word, infoidx: "100" });
-            const data = validate(await request(url));
-            const code = businessCode(data);
-            if ((code != null && code !== 200) || !data.data_body || typeof data.data_body !== "object"
-                || Array.isArray(data.data_body)) throw new BbdcError("invalid_response");
-            const matches = data.data_body.list === undefined ? [] : data.data_body.list;
-            if (!Array.isArray(matches)) throw new BbdcError("invalid_response");
-            return matches.length > 0;
+        async wordbook(deadline = Infinity) {
+            const loadPage = async page => {
+                const data = await read(ORIGIN + "/api/user-new-word?" + new URLSearchParams({ page: String(page) }));
+                const body = data.data_body;
+                const info = body?.pageInfo;
+                const records = body?.wordList;
+                if (businessCode(data) !== 200 || !Array.isArray(records) || !info
+                    || !Number.isSafeInteger(info.totalRecord) || info.totalRecord < 0
+                    || !Number.isSafeInteger(info.pageSize) || info.pageSize <= 0
+                    || !Number.isSafeInteger(info.totalPage) || info.totalPage < 0 || info.totalPage > 5000
+                    || info.currentPage !== page + 1
+                    || records.some(item => !item || typeof item.word !== "string" || !item.word.trim())) {
+                    throw new BbdcError("invalid_response");
+                }
+                return { info, records };
+            };
+            const first = await loadPage(0);
+            const { totalRecord, pageSize, totalPage } = first.info;
+            if ((totalRecord === 0 && (first.records.length !== 0 || totalPage > 1))
+                || (totalRecord > 0 && totalPage !== Math.ceil(totalRecord / pageSize))) {
+                throw new BbdcError("invalid_response");
+            }
+            const pages = [first];
+            for (let start = 1; start < totalPage; start += 3) {
+                if (Date.now() >= deadline) throw new BbdcError("wordbook_timeout");
+                const batch = Array.from({ length: Math.min(3, totalPage - start) }, (_, i) => start + i);
+                pages.push(...await Promise.all(batch.map(loadPage)));
+            }
+            let count = 0;
+            const words = new Set();
+            for (const [index, page] of pages.entries()) {
+                if (page.info.totalRecord !== totalRecord || page.info.pageSize !== pageSize
+                    || page.info.totalPage !== totalPage
+                    || page.records.length !== Math.min(pageSize, Math.max(0, totalRecord - index * pageSize))) {
+                    throw new BbdcError("wordbook_changed");
+                }
+                count += page.records.length;
+                for (const item of page.records) words.add(item.word.trim().toLowerCase());
+            }
+            if (count !== totalRecord) throw new BbdcError("wordbook_changed");
+            return words;
         },
         async definition(word) {
             const url = DICTIONARY + "/loadLexisList.action?" + new URLSearchParams({ strict: "1", word });
-            const data = validate(await request(url, { account: false }), false);
+            const data = await read(url, false);
             if (!Array.isArray(data.wordlist)) throw new BbdcError("invalid_response");
             if (!data.wordlist.length) return "";
             if (typeof data.wordlist[0]?.interpret !== "string") throw new BbdcError("invalid_response");
@@ -140,11 +184,14 @@ async function execute(client, action, terms, confirm, { limitMs = 22000, gapMs 
         if (inactive() || (action === "push" && !await confirm(terms))) return stop("cancelled");
     } catch (e) { return stop(e.code ?? "network_error"); }
     const deadline = Date.now() + limitMs;
+    let existing;
+    try { existing = await client.wordbook(deadline); }
+    catch (e) { return stop(e.code ?? "network_error"); }
     for (const word of terms) {
         if (inactive()) return stop("cancelled");
         if (Date.now() >= deadline) return stop("more_remaining");
         try {
-            if (await client.exists(word)) report.existing.push(word);
+            if (existing.has(word)) report.existing.push(word);
             else if (action === "check") report.missing.push(word);
             else {
                 if (Date.now() >= deadline) return stop("more_remaining");
@@ -153,6 +200,7 @@ async function execute(client, action, terms, confirm, { limitMs = 22000, gapMs 
                 if (Date.now() >= deadline) return stop("more_remaining");
                 await client.add(word, info);
                 report.added.push(word);
+                existing.add(word);
                 if (!info) report.without_definition.push(word);
             }
             report.remaining.shift();

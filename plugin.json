@@ -2,7 +2,7 @@
   "name": "bbdc-import-siyuan",
   "author": "PureMilkchun",
   "url": "https://github.com/PureMilkchun/bbdc-import-siyuan",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "minAppVersion": "3.8.6",
   "backends": [
     "windows",
